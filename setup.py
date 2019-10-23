@@ -4,14 +4,21 @@
 #
 #   python setup.py install
 #
-""" Concurrent logging handler (drop-in replacement for RotatingFileHandler)
+"""RotatingFileHandler replacement with concurrency, gzip and Windows support
 
 Overview
 ========
-This module provides an additional log handler for Python's standard logging
-package (PEP 282). This handler will write log events to log file which is 
+This package provides an additional log handler for Python's standard logging
+package (PEP 282). This handler will write log events to a log file which is
 rotated when the log file reaches a certain size.  Multiple processes can
-safely write to the same log file concurrently.
+safely write to the same log file concurrently. Rotated logs can be gzipped
+if enabled. Both Windows and POSIX systems are supported. An optional threaded
+queue logging handler is provided to perform logging in the background.
+
+This is a fork from Lowell Alleman's version with updates for Windows and
+recent versions of Python. It should be a drop-in replacement for users
+of the old version, except for changing the package name from
+`cloghandler` to `concurrent_log_handler`.
 
 Details
 =======
@@ -36,15 +43,13 @@ the same time and writing to the same log file, then *all* of the scripts should
 be using ``ConcurrentRotatingFileHandler``. You should not attempt to mix
 and match ``RotatingFileHandler`` and ``ConcurrentRotatingFileHandler``.
 
-This package bundles `portalocker`_ to deal with file locking.  Please be aware
-that portalocker only supports Unix (posix) an NT platforms at this time, and
-therefore this package only supports those platforms as well.
+This package bundles `portalocker`_ to deal with file locking.
 
 Installation
 ============
-Use the following command to install this package::
+Use the following command to download and install this package::
 
-    pip install ConcurrentLogHandler
+    pip install concurrent-log-handler
 
 If you are installing from source, you can use::
 
@@ -60,9 +65,9 @@ Here is a example demonstrating how to use this module directly (from within
 Python code)::
 
     from logging import getLogger, INFO
-    from cloghandler import ConcurrentRotatingFileHandler
+    from concurrent_log_handler import ConcurrentRotatingFileHandler
     import os
-    
+
     log = getLogger()
     # Use an absolute path to prevent file rotation trouble.
     logfile = os.path.abspath("mylogfile.log")
@@ -70,25 +75,25 @@ Python code)::
     rotateHandler = ConcurrentRotatingFileHandler(logfile, "a", 512*1024, 5)
     log.addHandler(rotateHandler)
     log.setLevel(INFO)
-    
+
     log.info("Here is a very exciting log message, just for you")
 
 
 Automatic fallback example
 --------------------------
 If you are distributing your code and you are unsure if the
-`ConcurrentLogHandler` package has been installed everywhere your code will run,
+`concurrent_log_handler` package has been installed everywhere your code will run,
 Python makes it easy to gracefully fallback to the built in
 `RotatingFileHandler`, here is an example::
 
     try:
-        from cloghandler import ConcurrentRotatingFileHandler as RFHandler
+        from concurrent_log_handler import ConcurrentRotatingFileHandler as RFHandler
     except ImportError:
         # Next 2 lines are optional:  issue a warning to the user
         from warnings import warn
-        warn("ConcurrentLogHandler package not installed.  Using builtin log handler")
+        warn("concurrent_log_handler package not installed.  Using builtin log handler")
         from logging.handlers import RotatingFileHandler as RFHandler
-    
+
     log = getLogger()
     rotateHandler = RFHandler("/path/to/mylogfile.log", "a", 1048576, 15)
     log.addHandler(rotateHandler)
@@ -105,31 +110,31 @@ Example config file: ``logging.ini``::
 
     [loggers]
     keys=root
-    
+
     [handlers]
     keys=hand01
-    
+
     [formatters]
     keys=form01
-    
+
     [logger_root]
     level=NOTSET
     handlers=hand01
-    
+
     [handler_hand01]
     class=handlers.ConcurrentRotatingFileHandler
     level=NOTSET
     formatter=form01
     args=("rotating.log", "a", 512*1024, 5)
-    
+
     [formatter_form01]
     format=%(asctime)s %(levelname)s %(message)s
 
 Example Python code: ``app.py``::
 
     import logging, logging.config
-    import cloghandler
-    
+    import concurrent_log_handler
+
     logging.config.fileConfig("logging.ini")
     log = logging.getLogger()
     log.info("Here is a very exciting log message, just for you")
@@ -137,15 +142,64 @@ Example Python code: ``app.py``::
 
 Change Log
 ==========
+- 0.9.16: Fix publishing issue with incorrect code included in the wheel
+  Affects Python 2 mainly - see Issue #21
+
+- 0.9.15: Fix bug from last version on Python 2. (Issue #21) Thanks @condontrevor
+  Also, on Python 2 and 3, apply unicode_error_policy (default: ignore) to convert
+  a log message to the output stream's encoding. I.e., by default it will filter
+  out (remove) any characters in a log message which cannot be converted to the
+  output logfile's encoding.
+
+- 0.9.14: Fix writing LF line endings on Windows when encoding is specified.
+  Added newline and terminator kwargs to allow customizing line ending behavior.
+  Thanks to @vashek
+
+- 0.9.13: Fixes Crashes with ValueError: I/O operation on closed file (issue #16)
+  Also should fix issue #13 with crashes related to Windows file locking.
+  Big thanks to @terencehonles, @nsmcan, @wkoot, @dismine for doing the hard parts
+
+- 0.9.12: Add umask option (thanks to @blakehilliard)
+  This adds the ability to control the permission flags when creating log files.
+
+- 0.9.11: Fix issues with gzip compression option (use buffering)
+
+- 0.9.10: Fix inadvertent lock sharing when forking
+   Thanks to @eriktews for this fix
+
+- 0.9.9: Fix Python 2 compatibility broken in last release
+
+- 0.9.8: Bug fixes and permission features
+   * Fix for issue #4 - AttributeError: 'NoneType' object has no attribute 'write'
+      This error could be caused if a rollover occurred inside a logging statement
+      that was generated from within another logging statement's format() call.
+   * Fix for PyWin32 dependency specification (explicitly require PyWin32)
+   * Ability to specify owner and permissions (mode) of rollover files [Unix only]
+
+- 0.9.7 / 0.9.6: Fix platform specifier for PyPi
+
+- 0.9.5: Add `use_gzip` option to compress rotated logs. Add an optional threaded
+logging queue handler based on the standard library's `logging.QueueHandler`.
+
+- 0.9.4: Fix setup.py to not include tests in distribution.
+
+- 0.9.3: Refactoring release
+   * For publishing fork on pypi as `concurrent-log-handler` under new package name.
+   * NOTE: PyWin32 is required on Windows but is not an explicit dependency because
+           the PyWin32 package is not currently installable through pip.
+   * Fix lock behavior / race condition
+
+- 0.9.2: Initial release of fork by Preston Landers.
+   * Fixes deadlocking issue with recent versions of Python
+   * Puts `.__` prefix in front of lock file name
+   * Use `secrets` or `SystemRandom` if available.
+   * Add/fix Windows support
 
 .. _Red Hat Bug #858912: https://bugzilla.redhat.com/show_bug.cgi?id=858912
 .. _Python Bug #15960: http://bugs.python.org/issue15960
 .. _LP Bug 1199332: https://bugs.launchpad.net/python-concurrent-log-handler/+bug/1199332
 .. _LP Bug 1199333: https://bugs.launchpad.net/python-concurrent-log-handler/+bug/1199333
-.. _LP Bug 1265150: https://bugs.launchpad.net/python-concurrent-log-handler/+bug/1265150
 
-- 0.9.2: (fork): Fixes the deadlocking problem on Windows `LP Bug 1265150`_
-   * https://github.com/Preston-Landers/ConcurrentLogHandler
 
 - 0.9.1:  Bug fixes - `LP Bug 1199332`_ and `LP Bug 1199333`_.
    * More gracefully handle out of disk space scenarios. Prevent release() from
@@ -162,7 +216,7 @@ Change Log
    * For anyone still using Python 2.3-2.5, please use the latest 0.8.x release
 
 - 0.8.6:  Fixed packaging bug with test script
-   * Fix a small packaging bug from the 0.8.5 release.  (Thanks to Björn Häuser 
+   * Fix a small packaging bug from the 0.8.5 release.  (Thanks to Björn Häuser
      for bringing this to my attention.)
    * Updated stresstest.py to always use the correct python version when
      launching sub-processes instead of the system's default "python".
@@ -182,7 +236,7 @@ Change Log
      log file contained ".log" in the middle of the log name.  For example, if
      you log file was "/var/log/mycompany.logging.mysource.log", the lock file
      would be named "/var/log/mycompany.ging.mysource.lock", which is not correct.
-     Thanks to Dirk Rothe for pointing this out.  Since this introduce a slight 
+     Thanks to Dirk Rothe for pointing this out.  Since this introduce a slight
      lock-file behavior difference, make sure all concurrent writers are updated
      to 0.8.4 at the same time if this issue effects you.
    * Updated ez_setup.py to 0.6c11
@@ -226,21 +280,24 @@ To-do
   threaded situation. If this is important to you, you could always add
   threading support to the ``stresstest.py`` script and send me the patch.
 
-
+* Update: this works in a multi-process concurrency environment but I have
+  not tested it extensively with threads or async, but that should be handled
+  by the parent logging class.
 """
+
 import sys
 
-extra = {}
-if sys.version_info >= (3, 0):
-    extra.update(use_2to3=True)
+extra = {
+    'use_2to3': False
+}
 
 from ez_setup import use_setuptools
+
 use_setuptools()
 
 from setuptools import setup
 
-
-VERSION = "0.9.2"
+VERSION = "0.9.16"
 classifiers = """\
 Development Status :: 4 - Beta
 Topic :: System :: Logging
@@ -250,36 +307,49 @@ Programming Language :: Python
 Programming Language :: Python :: 2.6
 Programming Language :: Python :: 2.7
 Programming Language :: Python :: 3
+Programming Language :: Python :: 3.5
+Programming Language :: Python :: 3.6
+Programming Language :: Python :: 3.7
 Topic :: Software Development :: Libraries :: Python Modules
 License :: OSI Approved :: Apache Software License
 """
 doc = __doc__.splitlines()
 
+install_requires = ['portalocker>=1.4.0']
+if "win" in sys.platform:
+    try:
+        import win32file
+    except ImportError:
+        # Only require pywin32 if not already installed
+        # version 223 introduced ability to install from pip
+        install_requires.append("pywin32>=223")
 
-setup(name='ConcurrentLogHandler',
+setup(name='concurrent-log-handler',
       version=VERSION,
-      author="Lowell Alleman",
-      author_email="lowell87@gmail.com",
-      py_modules=[
-        "cloghandler",
-        "portalocker_clh",
-        ],
-      package_dir={ '' : 'src', },
-      data_files=[
-        ('tests', ["stresstest.py"]),
-        ('docs', [
-            'README',
-            'LICENSE',
-            ]),
-      ],
-      url="http://launchpad.net/python-concurrent-log-handler",
-      license = "http://www.apache.org/licenses/LICENSE-2.0",
+      author="Preston Landers",
+      author_email="planders@gmail.com",
+      packages=['concurrent_log_handler'],
+      package_dir={'': 'src', },
+      # These aren't needed by the end user and shouldn't be installed to the Python root.
+      # data_files=[
+      #     ('tests', ["stresstest.py"]),
+      #     ('docs', [
+      #         'README.md',
+      #         'LICENSE',
+      #     ]),
+      # ],
+      url="https://github.com/Preston-Landers/concurrent-log-handler",
+      license="http://www.apache.org/licenses/LICENSE-2.0",
       description=doc.pop(0),
       long_description="\n".join(doc),
-      platforms = [ "nt", "posix" ],
-      keywords = "logging, windows, linux, unix, rotate, portalocker",
+      # platforms=["nt", "posix"],
+      install_requires=install_requires,
+      keywords="logging, windows, linux, unix, rotate, QueueHandler, QueueListener, portalocker",
       classifiers=classifiers.splitlines(),
       zip_safe=True,
-      #test_suite=unittest.TestSuite,
+      # test_suite=unittest.TestSuite,
       **extra
-)
+      )
+
+# Development build:
+# python setup.py clean --all build sdist bdist_wheel

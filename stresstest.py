@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# -*- coding: utf-8; mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
+# vim: fileencoding=utf-8 tabstop=4 expandtab shiftwidth=4
+
 """ stresstest.py:  A stress-tester for ConcurrentRotatingFileHandler
 
 This utility spawns a bunch of processes that all try to concurrently write to
@@ -12,18 +15,32 @@ multiple threads.
 
 """
 
+import gzip
+import io
+import os
+import string
+import sys
+from optparse import OptionParser
+from random import choice, randint
+from subprocess import Popen
+from time import sleep
+
+# local lib; for testing
+from concurrent_log_handler import ConcurrentRotatingFileHandler, PY2, randbits
+
 __version__ = '$Id$'
 __author__ = 'Lowell Alleman'
 
-import os
-import sys
-from subprocess import call, Popen, STDOUT
-from time import sleep
-
 ROTATE_COUNT = 5000
 
-# local lib; for testing
-from cloghandler import ConcurrentRotatingFileHandler
+# Not all encodings will work here unless you remove some of the Unicode
+# chars in the test string.
+# ENCODING = 'cp1252'
+
+# There are some issues with the test program in utf-16 but I think the logging itself works...?
+# ENCODING = 'utf-16'
+
+ENCODING = 'utf-8'
 
 
 class RotateLogStressTester:
@@ -35,18 +52,31 @@ class RotateLogStressTester:
         self.rotateSize = 128 * 1024
         self.rotateCount = ROTATE_COUNT
         self.random_sleep_mode = False
-        self.debug = False
+        self.debug = True
         self.logger_delay = logger_delay
+        self.log = None
+        self.use_gzip = True
+        self.extended_unicode = True
+        if PY2 and ENCODING != 'utf-8':
+            # hopefully temporary... the problem is with stdout in the tester I think
+            self.extended_unicode = False
 
     def getLogHandler(self, fn):
         """ Override this method if you want to test a different logging handler
         class. """
-        return ConcurrentRotatingFileHandler(fn, 'a', self.rotateSize,
-                                             self.rotateCount, delay=self.logger_delay,
-                                             debug=self.debug)
+        rv = ConcurrentRotatingFileHandler(
+            fn, 'a', self.rotateSize,
+            self.rotateCount, delay=self.logger_delay,
+            encoding=ENCODING,
+            debug=self.debug, use_gzip=self.use_gzip)
+
+        # To force LF only linefeeds on Windows: newline='', terminator='\n'
+        # To force CRLF on Unix: newline='', terminator='\r\n'
+
         # To run the test with the standard library's RotatingFileHandler:
         # from logging.handlers import RotatingFileHandler
         # return RotatingFileHandler(fn, 'a', self.rotateSize, self.rotateCount)
+        return rv
 
     def start(self):
         from logging import getLogger, FileHandler, Formatter, DEBUG
@@ -56,7 +86,7 @@ class RotateLogStressTester:
         formatter = Formatter(
             '%(asctime)s [%(process)d:%(threadName)s] %(levelname)-8s %(name)s:  %(message)s')
         # Unique log handler (single file)
-        handler = FileHandler(self.uniquefile, "w")
+        handler = FileHandler(self.uniquefile, "w", encoding=ENCODING)
         handler.setLevel(DEBUG)
         handler.setFormatter(formatter)
         self.log.addHandler(handler)
@@ -75,29 +105,42 @@ class RotateLogStressTester:
         self.run()
 
     def run(self):
+        print("Hello, self.writeLoops: %s" % (self.writeLoops,))
         c = 0
-        from random import choice, randint
+        import random
         # Use a bunch of random quotes, numbers, and severity levels to mix it up a bit!
         msgs = ["I found %d puppies", "There are %d cats in your hatz",
                 "my favorite number is %d", "I am %d years old.", "1 + 1 = %d",
                 "%d/0 = DivideByZero", "blah!  %d thingies!", "8 15 16 23 48 %d",
                 "the worlds largest prime number: %d", "%d happy meals!"]
+        if self.extended_unicode:
+            msgs.extend([
+                u"\U0001d122 \U00024b00 Euro: \u20ac%d",
+                u"my favorite number is %d ①②③④⑤⑥⑦⑧!"
+            ])
+
         logfuncts = [self.log.debug, self.log.info, self.log.warning, self.log.error]
 
         self.log.info("Starting to write random log message.   Loop=%d", self.writeLoops)
         while c <= self.writeLoops:
             c += 1
-            msg = choice(msgs)
-            logfunc = choice(logfuncts)
-            logfunc(msg, randint(0, 99999999))
+
+            self.log.debug(
+                "Triggering logging within format of another log: %r",
+                InnerLoggerExample(
+                    self.log, randbits(64), rand_string(1024 * 10)))
+
+            msg = random.choice(msgs)
+            logfunc = random.choice(logfuncts)
+            logfunc(msg, randbits(64))
 
             if self.random_sleep_mode and c % 1000 == 0:
-                # Sleep from 0-15 seconds
-                s = randint(1, 15)
+                # Sleep from 0-5 seconds
+                s = randint(0, 5)
                 print("PID %d sleeping for %d seconds" % (os.getpid(), s))
                 sleep(s)
-            # break
-        self.log.info("Done witting random log messages.")
+                # break
+        self.log.info("Done writing random log messages.")
 
 
 def iter_lognames(logfile, count):
@@ -110,38 +153,80 @@ def iter_lognames(logfile, count):
 def iter_logs(iterable, missing_ok=False):
     """ Generator to extract log entries from shared log file. """
     for fn in iterable:
-        if os.path.exists(fn):
-            for line in open(fn):
-                yield line
+        opener = open
+        log_path = fn
+        log_path_gz = log_path + ".gz"
+        if os.path.exists(log_path_gz):
+            log_path = log_path_gz
+            opener = gzip.open
+
+        if os.path.exists(log_path):
+            with opener(log_path, "rb") as fh:
+                for line in fh:
+                    yield line
         elif not missing_ok:
-            raise ValueError("Missing log file %s" % fn)
+            raise ValueError("Missing log file %s" % log_path)
 
 
-def combine_logs(combinedlog, iterable, mode="w"):
+def combine_logs(combinedlog, iterable, mode="wb"):
     """ write all lines (iterable) into a single log file. """
-    fp = open(combinedlog, mode)
+    fp = io.open(combinedlog, mode)
+    if ENCODING == 'utf-16':
+        import codecs
+        fp.write(codecs.BOM_UTF16)
     for chunk in iterable:
         fp.write(chunk)
     fp.close()
 
 
-from optparse import OptionParser
+class InnerLoggerExample(object):
+    def __init__(self, log, a, b):
+        self.log = log
+        self.a = a
+        self.b = b
 
-parser = OptionParser(usage="usage:  %prog",
-                      version=__version__,
-                      description="Stress test the cloghandler module.")
-parser.add_option("--log-calls", metavar="NUM",
-                  action="store", type="int", default=50000,
-                  help="Number of logging entries to write to each log file.  "
-                       "Default is %default")
-parser.add_option("--random-sleep-mode",
-                  action="store_true", default=False)
-parser.add_option("--debug",
-                  action="store_true", default=False)
-parser.add_option("--logger-delay",
-                  action="store_true", default=False,
-                  help="Enable the 'delay' mode in the logger class. "
-                       "This means that the log file will be opened on demand.")
+    def __str__(self):
+        # This should trigger a logging event within the format() handling of another event
+        self.log.debug("Inner logging example: a=%r, b=%r", self.a, self.b)
+        return "<InnerLoggerExample a=%r>" % (self.a,)
+
+    def __repr__(self):
+        return str(self)
+
+
+allchar = string.ascii_letters + string.punctuation + string.digits
+
+
+def rand_string(str_len):
+    chars = []
+    for i in range(0, str_len):
+        c = choice(allchar)
+        if i % 10 == 0:
+            c = " "
+        chars.append(c)
+    return "".join(chars)
+
+
+parser = OptionParser(
+    usage="usage:  %prog",
+    version=__version__,
+    description="Stress test the concurrent_log_handler module.")
+parser.add_option(
+    "--log-calls", metavar="NUM",
+    action="store", type="int", default=5000,
+    help="Number of logging entries to write to each log file.  "
+         "Default is %default")
+parser.add_option(
+    "--random-sleep-mode",
+    action="store_true", default=False)
+parser.add_option(
+    "--debug",
+    action="store_true", default=False)
+parser.add_option(
+    "--logger-delay",
+    action="store_true", default=False,
+    help="Enable the 'delay' mode in the logger class. "
+         "This means that the log file will be opened on demand.")
 
 
 def main_client(args):
@@ -173,10 +258,17 @@ class TestManager:
             for key, val in kwargs.items():
                 setattr(self, key, val)
 
-    def __init__(self):
+    def __init__(self, output_path):
+        self.output_path = output_path
         self.tests = []
+        self.client_stdout = io.open(os.path.join(output_path, "client_stdout.txt"), "a", encoding=ENCODING)
+        self.client_stderr = io.open(os.path.join(output_path, "client_stderr.txt"), "a", encoding=ENCODING)
 
     def launchPopen(self, *args, **kwargs):
+        if "stdout" not in kwargs:
+            kwargs["stdout"] = self.client_stdout
+        if "stderr" not in kwargs:
+            kwargs["stderr"] = self.client_stdout
         proc = Popen(*args, **kwargs)
         cp = self.ChildProc(popen=proc)
         self.tests.append(cp)
@@ -198,30 +290,51 @@ class TestManager:
 
     def checkExitCodes(self):
         for cp in self.tests:
-            if cp.popen.poll() != 0:
+            stdout_str, stderr_str = cp.popen.communicate()
+            exit_code = cp.popen.poll()
+            if exit_code != 0:
+                print(stderr_str)
+                print(stderr_str)
+                print("cp exit code: %s: %s" % (cp, exit_code))
                 return False
         return True
 
 
-def unified_diff(a, b, out=sys.stdout):
+def unified_diff(a, b, out=sys.stdout, out2=None):
     import difflib
-    ai = open(a).readlines()
-    bi = open(b).readlines()
+    dfile = None
+    if out2:
+        dfile = io.open(out2, "w", encoding=ENCODING)
+    ai = io.open(a, "r", encoding=ENCODING).readlines()
+    bi = io.open(b, "r", encoding=ENCODING).readlines()
     for line in difflib.unified_diff(ai, bi, a, b):
-        out.write(line)
+        # if PY2:
+        #     line = line.encode(ENCODING)
+        if PY2:
+            if not isinstance(line, unicode):
+                line = unicode(line, ENCODING)
+            line_out = line.encode(out.encoding, 'ignore').decode(out.encoding)
+            out.write(line_out)
+        else:
+            out.write(line)
+        if dfile:
+            dfile.write(line)
 
 
 def main_runner(args):
-    parser.add_option("--processes", metavar="NUM",
-                      action="store", type="int", default=3,
-                      help="Number of processes to spawn.  Default: %default")
-    parser.add_option("--delay", metavar="secs",
-                      action="store", type="float", default=2.5,
-                      help="Wait SECS before spawning next processes.  "
-                           "Default: %default")
-    parser.add_option("-p", "--path", metavar="DIR",
-                      action="store", default="test",
-                      help="Path to a temporary directory.  Default: '%default'")
+    parser.add_option(
+        "--processes", metavar="NUM",
+        action="store", type="int", default=3,
+        help="Number of processes to spawn.  Default: %default")
+    parser.add_option(
+        "--delay", metavar="secs",
+        action="store", type="float", default=2.5,
+        help="Wait SECS before spawning next processes.  "
+             "Default: %default")
+    parser.add_option(
+        "-p", "--path", metavar="DIR",
+        action="store", default="test_output",
+        help="Path to a temporary directory.  Default: '%default'")
 
     this_script = args[0]
     (options, args) = parser.parse_args(args)
@@ -229,7 +342,7 @@ def main_runner(args):
     if not os.path.isdir(options.path):
         os.makedirs(options.path)
 
-    manager = TestManager()
+    manager = TestManager(options.path)
     shared = os.path.join(options.path, "shared.log")
     for client_id in range(options.processes):
         client = os.path.join(options.path, "client.log_client%s.log" % client_id)
@@ -260,11 +373,7 @@ def main_runner(args):
     # Combine all of the log files...
     client_files = [child.clientfile for child in manager.tests]
 
-    if False:
-        def sort_em(iterable):
-            return iterable
-    else:
-        sort_em = sorted
+    sort_em = sorted
 
     print("Writing out combined client logs...")
     combine_logs(client_combo, sort_em(iter_logs(client_files)))
@@ -276,10 +385,17 @@ def main_runner(args):
     combine_logs(shared_combo, sort_em(log_lines))
     print("done.")
 
-    print(
-        "Running internal diff:  (If the next line is 'end of diff', then the stress test passed!)")
-    unified_diff(client_combo, shared_combo)
+    print("Running internal diff:  "
+          "(If the next line is 'end of diff', then the stress test passed!)")
+    diff_file = os.path.join(options.path, "diff.patch")
+    unified_diff(client_combo, shared_combo, sys.stdout, diff_file)
     print("   --- end of diff ----")
+
+
+def decode(thing, encoding=ENCODING):
+    if isinstance(thing, bytes):
+        return thing.decode(encoding=encoding)
+    return thing
 
 
 if __name__ == '__main__':
